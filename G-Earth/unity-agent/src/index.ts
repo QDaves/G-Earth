@@ -1,4 +1,5 @@
 import "frida-il2cpp-bridge";
+import { IncomingCoordinatorResult, IncomingFrameCoordinator } from "./incoming-stream";
 
 function log(message: string): void { try { console.log(message); } catch (e) {} }
 
@@ -12,6 +13,7 @@ const DIR_TO_SERVER = 1;
 const TAG_VERDICT = 0x10;
 const TAG_INJECT = 0x20;
 const MAX_HEADER = 4000;
+const MAX_FRAME_LENGTH = 0x200000;
 
 // port and cookie come from frida-inject -P through rpc.exports.init
 let bridgeport = 9399;
@@ -160,6 +162,24 @@ function interceptOut(bytes: number[]): { blocked: boolean; bytes: number[] } | 
   } finally { leaveCriticalSection(criticalSection); outBusy = false; }
 }
 
+let inBusy = false;
+function interceptIn(bytes: number[]): { blocked: boolean; bytes: number[] } | null {
+  if (!bridgeReady || inBusy) { sendFrame(FRAME_NOTIFY, DIR_TO_CLIENT, bytes); return null; }
+  inBusy = true;
+  enterCriticalSection(criticalSection);
+  try {
+    if (!sendFrameRaw(FRAME_INTERCEPT, DIR_TO_CLIENT, bytes)) { bridgeReady = false; return null; }
+    let guard = 0;
+    for (; ;) {
+      if (++guard > 4096) { bridgeReady = false; return null; }
+      const frame = readFrame();
+      if (!frame) { bridgeReady = false; return null; }
+      if (frame.tag === TAG_INJECT) { queueInject(frame.bytes); continue; }
+      if (frame.tag === TAG_VERDICT) { const payload = frame.bytes; const result: number[] = []; for (let index = 1; index < payload.length; index++) result.push(payload[index]); return { blocked: payload.length > 0 && payload[0] === 1, bytes: result }; }
+    }
+  } finally { leaveCriticalSection(criticalSection); inBusy = false; }
+}
+
 // il2cpp array offsets, 32 vs 64 bit
 const pointerSize = Process.pointerSize;
 const ARRAY_LENGTH_OFFSET = pointerSize === 8 ? 24 : 12;
@@ -177,6 +197,16 @@ function readArray(array: NativePointer, offset: number, length: number): number
   const result: number[] = [];
   const data = new Uint8Array(array.add(ARRAY_DATA_OFFSET + offset).readByteArray(count)!);
   for (let index = 0; index < count; index++) result.push(data[index]);
+  return result;
+}
+function readChunk(array: NativePointer, offset: number, length: number): number[] | null {
+  const total = array.add(ARRAY_LENGTH_OFFSET).readS32();
+  if (offset < 0 || length <= 0 || length > MAX_FRAME_LENGTH + 4 || offset > total || length > total - offset) return null;
+  const raw = array.add(ARRAY_DATA_OFFSET + offset).readByteArray(length);
+  if (raw === null) return null;
+  const result: number[] = [];
+  const data = new Uint8Array(raw);
+  for (let index = 0; index < length; index++) result.push(data[index]);
   return result;
 }
 function isHabbo(bytes: number[]): boolean {
@@ -201,25 +231,13 @@ const cipherLog: { input: number; output: number; engine: NativePointer; threadI
 function recordCipher(input: number, output: number, engine: NativePointer, threadId: number): void { cipherLog.push({ input, output, engine, threadId }); if (cipherLog.length > CIPHER_LOG_MAX) cipherLog.shift(); }
 function findByOutput(output: number, threadId: number): { input: number; output: number; engine: NativePointer; threadId: number } | null { for (let index = cipherLog.length - 1; index >= 0; index--) { const record = cipherLog[index]; if (record.output === output && record.threadId === threadId) return record; } return null; }
 
-const pendingIn: { cipherIn4: number; cipherIn5: number; bytes: number[] }[] = [];
-let inHalf: { cipherIn: number; plain: number } | null = null;
+const pendingDispatch: { blocked: boolean; original: number[]; bytes: number[] }[] = [];
+const incomingCoordinator = new IncomingFrameCoordinator(MAX_FRAME_LENGTH, MAX_HEADER, 6000);
 let cipherActive = false;
-function resolveInPair(first: { cipherIn: number; plain: number }, second: { cipherIn: number; plain: number }): number {
-  for (let index = 0; index < pendingIn.length; index++) {
-    const entry = pendingIn[index]; let plain4: number, plain5: number;
-    if (entry.cipherIn5 === first.cipherIn && entry.cipherIn4 === second.cipherIn) { plain5 = first.plain; plain4 = second.plain; }
-    else if (entry.cipherIn5 === second.cipherIn && entry.cipherIn4 === first.cipherIn) { plain5 = second.plain; plain4 = first.plain; }
-    else continue;
-    const header = (plain4 << 8) | plain5;
-    if (header < 0 || header >= 6000) continue;
-    entry.bytes[4] = plain4; entry.bytes[5] = plain5;
-    return index;
-  }
-  return -1;
-}
 function resetCipherState(): void {
-  outEngine = null; inEngine = null; cipherActive = false; inHalf = null; cipherLocked = false;
-  cipherLog.length = 0; pendingIn.length = 0;
+  outEngine = null; inEngine = null; cipherActive = false; cipherLocked = false;
+  cipherLog.length = 0; pendingDispatch.length = 0;
+  incomingCoordinator.reset();
   log("[agent] relogin detected, cipher state reset");
 }
 function isHello(bytes: number[]): boolean {
@@ -400,16 +418,22 @@ function findToClientDispatch(returnAddress: NativePointer): boolean {
   return false;
 }
 function hookDispatch(address: NativePointer): void {
-  Interceptor.attach(address, {
-    onEnter(args) {
-      if (toClientInjecting || toClientReady) return;
-      try {
-        const reader = args[0]; toClientDispatchTarget = args[1]; toClientReaderClass = new Il2Cpp.Object(reader).class;
+  const original = toClientDispatch!;
+  Interceptor.replace(address, new NativeCallback((reader: NativePointer, target: NativePointer) => {
+    if (toClientInjecting) { original(reader, target); return; }
+    try {
+      toClientDispatchTarget = target; toClientReaderClass = new Il2Cpp.Object(reader).class;
+      if (!toClientReady) {
         toClientCtorArg0 = reader.add(toClientCtorArg0Offset).readPointer(); toClientCtorArg1 = reader.add(toClientCtorArg1Offset).readPointer();
         if (!toClientDispatchTarget.isNull() && !toClientCtorArg0.isNull() && toClientByteClass) { toClientReady = true; log("[tc] ready, toclient inject armed"); }
-      } catch (e) { logErr("tc-cap", e); }
-    }
-  });
+      }
+      const verdict = pendingDispatch.shift();
+      if (!verdict) { original(reader, target); return; }
+      if (verdict.blocked) return;
+      if (!toClientReady || verdict.bytes.length < 6 || !isHabbo(verdict.bytes) || sameBytes(verdict.bytes, verdict.original)) { original(reader, target); return; }
+      injectToClient((verdict.bytes[4] << 8) | verdict.bytes[5], verdict.bytes.slice(6));
+    } catch (e) { logErr("tc-dispatch", e); original(reader, target); }
+  }, "void", ["pointer", "pointer"]));
 }
 
 let errorCount = 0;
@@ -482,7 +506,38 @@ function main(): void {
   byteClass = Il2Cpp.corlib.class("System.Byte");
   toClientByteClass = byteClass;
   log("[disc] cipher=" + discovered.cipher.length + " outCand=" + discovered.outCand.length + " inCand=" + discovered.inCand.length + " outSend=" + discovered.outSend.length);
-  if (discovered.inCand.length) setupToClient(discovered.inCand[0]);
+  const incomingCandidates: Cand[] = [];
+  const incomingCandidatesById = new Map<string, Cand>();
+  for (const candidate of discovered.inCand) {
+    const candidateId = candidate.address.toString();
+    if (incomingCandidatesById.has(candidateId)) continue;
+    incomingCandidates.push(candidate);
+    incomingCandidatesById.set(candidateId, candidate);
+  }
+  let configuredIncomingId: string | null = null;
+  const configureIncoming = (candidate: Cand): void => {
+    const candidateId = candidate.address.toString();
+    if (configuredIncomingId === candidateId) return;
+    if (setupToClient(candidate)) configuredIncomingId = candidateId;
+  };
+  const publishIncoming = (result: IncomingCoordinatorResult): void => {
+    if (result.error) logErr("in-frame", result.error);
+    if (result.boundChanged && result.boundCandidateId) {
+      const candidate = incomingCandidatesById.get(result.boundCandidateId);
+      if (candidate) {
+        configureIncoming(candidate);
+        log("[IN bound] " + candidate.className);
+      }
+    }
+    for (const frame of result.frames) {
+      const header = frame.bytes[4] * 0x100 + frame.bytes[5];
+      const verdict = header <= MAX_HEADER ? interceptIn(frame.bytes) : null;
+      pendingDispatch.push({ blocked: verdict?.blocked ?? false, original: frame.bytes, bytes: verdict?.bytes ?? frame.bytes });
+      if (pendingDispatch.length > 512) { pendingDispatch.shift(); logErr("pendDispatch-cap", "dropped oldest"); }
+      inCount++;
+    }
+  };
+  if (incomingCandidates.length) configureIncoming(incomingCandidates[0]);
 
   if (discovered.cipher.length) { cipherFn = new NativeFunction(discovered.cipher[0].address, "int", ["pointer", "int", "pointer"]); cipherMethod = discovered.cipher[0].handle; }
 
@@ -492,22 +547,17 @@ function main(): void {
       onLeave(ret) {
         if (shuttingDown || injecting) return;
         try {
+          const input = (this as any).inputByte as number;
           const output = ret.toInt32() & 0xff; cipherActive = true;
           const engine = (this as any).engine as NativePointer;
           const isInbound = outEngine ? !engine.equals(outEngine) : false;
           if (isInbound && !inEngine) { inEngine = engine; log("[eng] inEngine locked " + engine + " tid=" + Process.getCurrentThreadId()); }
-          if (!isInbound) recordCipher((this as any).inputByte, output, engine, Process.getCurrentThreadId());
+          if (!isInbound) recordCipher(input, output, engine, Process.getCurrentThreadId());
           // lock the cipher method that runs on the out engine, discovery can pick a different byte(byte)
           if (!isInbound && outEngine && !cipherLocked) { cipherFn = new NativeFunction(cand.address, "int", ["pointer", "int", "pointer"]); cipherMethod = cand.handle; cipherLocked = true; log("[eng] out cipher locked " + rvaOf(cand.address)); }
           if (isInbound && (outEngine || inEngine)) {
             inCipher++;
-            if (!inHalf) { inHalf = { cipherIn: (this as any).inputByte, plain: output }; }
-            else {
-              const pair = { cipherIn: (this as any).inputByte, plain: output };
-              const matchedIndex = resolveInPair(inHalf, pair);
-              if (matchedIndex >= 0) { const entry = pendingIn[matchedIndex]; pendingIn.splice(matchedIndex, 1); inCount++; try { notify(DIR_TO_CLIENT, entry.bytes); } catch (e) {} inHalf = null; }
-              else { inHalf = pair; }
-            }
+            publishIncoming(incomingCoordinator.cipher(Process.getCurrentThreadId(), input, output));
           }
         } catch (e) { logErr("cipher", e); }
       }
@@ -567,22 +617,38 @@ function main(): void {
     } catch (e) {}
   });
 
-  let inHookLogged = false;
-  discovered.inCand.forEach(cand => {
+  incomingCandidates.forEach(cand => {
+    const candidateAddress = cand.address.toString();
     Interceptor.attach(cand.address, {
       onEnter(args) {
-        if (shuttingDown) return;
+        (this as any).incomingCandidateId = null;
+        (this as any).incomingFrameIds = [];
+        (this as any).incomingPlainEligible = false;
+        if (shuttingDown || toClientInjecting) return;
         try {
+          if (incomingCoordinator.boundCandidateId !== null && incomingCoordinator.boundCandidateId !== candidateAddress) return;
+          const threadId = Process.getCurrentThreadId();
           const array = args[1], offset = args[2].toInt32(), length = args[3].toInt32();
-          if (array.isNull() || length < 6) return;
+          if (array.isNull() || length <= 0) return;
           if (toClientRecv && !toClientDispatch) findToClientDispatch((this as any).returnAddress);
-          const bytes = readArray(array, offset, length);
-          if (!isHabbo(bytes)) return;
-          if (!inHookLogged) { inHookLogged = true; log("[IN bound] " + cand.className + " tid=" + Process.getCurrentThreadId()); }
-          if (!cipherActive) { if (((bytes[4] << 8) | bytes[5]) <= MAX_HEADER) { inCount++; notify(DIR_TO_CLIENT, bytes); } return; }
-          pendingIn.push({ cipherIn4: bytes[4], cipherIn5: bytes[5], bytes });
-          if (pendingIn.length > 96) { pendingIn.shift(); logErr("pendIn-cap", "dropped oldest"); }
+          const chunk = readChunk(array, offset, length);
+          if (chunk === null) {
+            publishIncoming(incomingCoordinator.reject(candidateAddress, threadId, "incoming receive range is invalid"));
+            return;
+          }
+          const result = incomingCoordinator.append(candidateAddress, threadId, chunk);
+          (this as any).incomingCandidateId = candidateAddress;
+          (this as any).incomingFrameIds = result.completedFrameIds;
+          (this as any).incomingPlainEligible = !cipherActive;
+          publishIncoming(result);
         } catch (e) { logErr("inrecv", e); }
+      },
+      onLeave() {
+        if (shuttingDown || !(this as any).incomingPlainEligible || cipherActive) return;
+        const candidateId = (this as any).incomingCandidateId as string | null;
+        const frameIds = (this as any).incomingFrameIds as number[];
+        if (!candidateId || frameIds.length === 0) return;
+        publishIncoming(incomingCoordinator.plain(candidateId, frameIds));
       }
     });
   });
@@ -594,7 +660,7 @@ function main(): void {
   let lastOut = 0, lastIn = 0;
   every(5000, () => {
     if (shuttingDown) return;
-    log("[stat] out=" + outCount + "(+" + (outCount - lastOut) + ") in=" + inCount + "(+" + (inCount - lastIn) + ") inCipher=" + inCipher + " ge=" + (bridgeReady ? 1 : 0) + " cipher=" + (cipherActive ? 1 : 0) + " outEng=" + (outEngine ? 1 : 0) + " inEng=" + (inEngine ? 1 : 0) + " pendIn=" + pendingIn.length + " injQ=" + injectQueue.length);
+    log("[stat] out=" + outCount + "(+" + (outCount - lastOut) + ") in=" + inCount + "(+" + (inCount - lastIn) + ") inCipher=" + inCipher + " ge=" + (bridgeReady ? 1 : 0) + " cipher=" + (cipherActive ? 1 : 0) + " outEng=" + (outEngine ? 1 : 0) + " inEng=" + (inEngine ? 1 : 0) + " pendIn=" + incomingCoordinator.pendingCount + " injQ=" + injectQueue.length);
     lastOut = outCount; lastIn = inCount;
   });
 }
