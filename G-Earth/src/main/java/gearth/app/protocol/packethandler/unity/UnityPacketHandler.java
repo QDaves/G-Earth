@@ -12,6 +12,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.Duration;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class UnityPacketHandler extends PacketHandler {
 
@@ -57,5 +61,33 @@ public class UnityPacketHandler extends PacketHandler {
             awaitListeners(hMessage, hMessage1 -> sendToStream(hMessage1.getPacket().toBytes()));
             currentIndex++;
         }
+    }
+
+    public Verdict intercept(byte[] buffer, Duration timeout) throws IOException {
+        synchronized (actLock) {
+            HMessage message = new HMessage(new HPacket(buffer), direction, currentIndex++);
+            try {
+                HMessage result = manipulate(message).get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+                return new Verdict(result.isBlocked(), result.getPacket().toBytes());
+            } catch (TimeoutException exception) {
+                LOG.warn("Unity packet interception timed out after {} ms for direction {}", timeout.toMillis(), direction);
+                return new Verdict(false, message.getPacket().toBytes());
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Unity packet interception was interrupted", exception);
+            } catch (ExecutionException exception) {
+                throw new IOException("Unity packet interception failed", exception.getCause());
+            }
+        }
+    }
+
+    public void report(byte[] buffer) {
+        synchronized (actLock) {
+            HMessage message = new HMessage(new HPacket(buffer), direction, currentIndex++);
+            manipulate(message);
+        }
+    }
+
+    public record Verdict(boolean blocked, byte[] bytes) {
     }
 }

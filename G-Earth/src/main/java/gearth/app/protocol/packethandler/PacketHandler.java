@@ -6,6 +6,7 @@ import gearth.app.protocol.TrafficListener;
 import gearth.app.services.extension_handler.ExtensionHandler;
 
 import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
 
 public abstract class PacketHandler {
 
@@ -33,14 +34,22 @@ public abstract class PacketHandler {
     }
 
     protected void awaitListeners(HMessage message, PacketSender packetSender) {
-        notifyListeners(TrafficListener.BEFORE_MODIFICATION, message);
-        notifyListeners(TrafficListener.MODIFICATION, message);
-        extensionHandler.handle(message, message2 -> {
-            notifyListeners(TrafficListener.AFTER_MODIFICATION, message2);
+        manipulate(message).thenAccept(message2 -> {
             if (!message2.isBlocked()) {
                 packetSender.send(message2);
             }
         });
+    }
+
+    protected CompletableFuture<HMessage> manipulate(HMessage message) {
+        notifyListeners(TrafficListener.BEFORE_MODIFICATION, message);
+        notifyListeners(TrafficListener.MODIFICATION, message);
+        CompletableFuture<HMessage> result = new CompletableFuture<>();
+        extensionHandler.handle(message, message2 -> {
+            notifyListeners(TrafficListener.AFTER_MODIFICATION, message2);
+            result.complete(message2);
+        });
+        return result;
     }
 
 }

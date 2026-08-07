@@ -2,10 +2,14 @@ package gearth.app.ui.subforms.connection;
 
 import gearth.app.GEarth;
 import gearth.app.misc.Cacher;
+import gearth.app.misc.OSValidator;
 import gearth.protocol.connection.HClient;
 import gearth.app.protocol.connection.HState;
 import gearth.app.protocol.connection.proxy.ProxyProviderFactory;
+import gearth.app.protocol.connection.proxy.unity.UnityLaunchMode;
 import gearth.services.Constants;
+import gearth.app.ui.titlebar.TitleBarAlert;
+import gearth.app.ui.translations.LanguageBundle;
 import gearth.app.ui.translations.TranslatableString;
 import javafx.application.Platform;
 import javafx.event.ActionEvent;
@@ -18,6 +22,7 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 public class ConnectionController extends SubForm {
@@ -255,9 +260,13 @@ public class ConnectionController extends SubForm {
                 Platform.runLater(() -> rd_origins.setSelected(true));
                 getHConnection().start(HClient.SHOCKWAVE);
             }
-            else if (connectMode.equals("unity")) {
+            else if (connectMode.equals("unity") || connectMode.equals("unity-web")) {
                 Platform.runLater(() -> rd_unity.setSelected(true));
-                getHConnection().startUnity();
+                connectUnity(UnityLaunchMode.WEB);
+            }
+            else if (connectMode.equals("unity-standalone") || connectMode.equals("unity-build")) {
+                Platform.runLater(() -> rd_unity.setSelected(true));
+                connectUnity(UnityLaunchMode.STANDALONE);
             }
             else if (connectMode.equals("nitro")) {
                 Platform.runLater(() -> rd_nitro.setSelected(true));
@@ -269,8 +278,16 @@ public class ConnectionController extends SubForm {
 
     public void btnConnect_clicked(ActionEvent actionEvent) {
         if (getHConnection().getState() == HState.NOT_CONNECTED) {
+            UnityLaunchMode unityMode = null;
+            if (isClientMode(HClient.UNITY)) {
+                unityMode = selectUnityMode();
+                if (unityMode == null) {
+                    return;
+                }
+            }
 
             btnConnect.setDisable(true);
+            UnityLaunchMode selectedUnityMode = unityMode;
             new Thread(() -> {
                 if (isClientMode(HClient.FLASH)) {
                     if (cbx_autodetect.isSelected()) {
@@ -281,7 +298,7 @@ public class ConnectionController extends SubForm {
                 } else if (isClientMode(HClient.SHOCKWAVE)) {
                     getHConnection().start(HClient.SHOCKWAVE);
                 } else if (isClientMode(HClient.UNITY)) {
-                    getHConnection().startUnity();
+                    getHConnection().startUnity(selectedUnityMode);
                 } else if (isClientMode(HClient.NITRO)) {
                     getHConnection().startNitro();
                 }
@@ -295,6 +312,47 @@ public class ConnectionController extends SubForm {
         else {
             getHConnection().abort();
         }
+    }
+
+    private void connectUnity(UnityLaunchMode mode) {
+        Thread thread = new Thread(() -> getHConnection().startUnity(mode), "unity-connect");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private UnityLaunchMode selectUnityMode() {
+        if (!OSValidator.isWindows()) {
+            return UnityLaunchMode.WEB;
+        }
+        ButtonType web = new ButtonType(LanguageBundle.get("tab.connection.client.unity.choice.web"));
+        ButtonType standalone = new ButtonType(LanguageBundle.get("tab.connection.client.unity.choice.standalone"));
+        ButtonType cancel = new ButtonType(
+                LanguageBundle.get("tab.connection.button.abort"),
+                ButtonBar.ButtonData.CANCEL_CLOSE);
+        Alert alert = new Alert(Alert.AlertType.CONFIRMATION, "", web, standalone, cancel);
+        alert.setTitle(LanguageBundle.get("tab.connection.client.unity.choice.title"));
+        alert.setHeaderText(null);
+        for (ButtonType type : List.of(web, standalone)) {
+            Button button = (Button) alert.getDialogPane().lookupButton(type);
+            button.setMinWidth(140);
+            button.setPrefWidth(140);
+        }
+        Label content = new Label(LanguageBundle.get("tab.connection.client.unity.choice.content"));
+        content.setWrapText(true);
+        alert.getDialogPane().setContent(content);
+        alert.getDialogPane().setPrefWidth(420);
+        try {
+            Optional<ButtonType> result = TitleBarAlert.create(alert).showAlertAndWait();
+            if (result.isPresent() && result.get() == web) {
+                return UnityLaunchMode.WEB;
+            }
+            if (result.isPresent() && result.get() == standalone) {
+                return UnityLaunchMode.STANDALONE;
+            }
+        } catch (Exception exception) {
+            exception.printStackTrace();
+        }
+        return null;
     }
 
     @Override
