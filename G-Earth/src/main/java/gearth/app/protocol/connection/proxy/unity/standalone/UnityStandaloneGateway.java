@@ -43,8 +43,6 @@ import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLParameters;
-import javax.net.ssl.SNIHostName;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -88,6 +86,7 @@ final class UnityStandaloneGateway implements AutoCloseable {
 
     private volatile MultiThreadIoEventLoopGroup networkGroup;
     private volatile Channel upstream;
+    private volatile UnityUpstreamTls upstreamRelay;
     private volatile Channel localServer;
     private volatile Bridge bridge;
     private volatile Process clientProcess;
@@ -154,6 +153,10 @@ final class UnityStandaloneGateway implements AutoCloseable {
         if (remote != null) {
             remote.close().syncUninterruptibly();
         }
+        UnityUpstreamTls relay = upstreamRelay;
+        if (relay != null) {
+            relay.close();
+        }
         MultiThreadIoEventLoopGroup group = networkGroup;
         if (group != null) {
             group.shutdownGracefully().syncUninterruptibly();
@@ -208,38 +211,48 @@ final class UnityStandaloneGateway implements AutoCloseable {
         if (host == null) {
             throw new IllegalStateException("Unity client did not select an upstream host");
         }
-        URI uri = URI.create("wss://" + host + ":" + port + "/websocket");
+        UnityUpstreamTls relay = UnityUpstreamTls.connect(host, port);
+        upstreamRelay = relay;
+        URI uri = URI.create("ws://" + host + ":" + port + "/websocket");
         CompletableFuture<Void> handshake = new CompletableFuture<>();
-        Channel remote = new Bootstrap()
-                .group(networkGroup)
-                .channel(NioSocketChannel.class)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
-                .handler(new ChannelInitializer<SocketChannel>() {
-                    @Override
-                    protected void initChannel(SocketChannel channel) throws Exception {
-                        channel.pipeline().addLast("ssl", upstreamSsl(host));
-                        channel.pipeline().addLast("http", new HttpClientCodec());
-                        channel.pipeline().addLast("httpAggregator", new HttpObjectAggregator(65536));
-                        channel.pipeline().addLast("websocket", new WebSocketClientProtocolHandler(
-                                uri,
-                                WebSocketVersion.V13,
-                                null,
-                                false,
-                                new DefaultHttpHeaders(),
-                                MAXIMUM_FRAME_LENGTH));
-                        channel.pipeline().addLast("websocketAggregator", new WebSocketFrameAggregator(MAXIMUM_FRAME_LENGTH));
-                        channel.pipeline().addLast("frames", new UpstreamFrames(handshake));
-                    }
-                })
-                .connect(host, port)
-                .sync()
-                .channel();
+        Channel remote;
+        try {
+            remote = new Bootstrap()
+                    .group(networkGroup)
+                    .channel(NioSocketChannel.class)
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel channel) {
+                            channel.pipeline().addLast("http", new HttpClientCodec());
+                            channel.pipeline().addLast("httpAggregator", new HttpObjectAggregator(65536));
+                            channel.pipeline().addLast("websocket", new WebSocketClientProtocolHandler(
+                                    uri,
+                                    WebSocketVersion.V13,
+                                    null,
+                                    false,
+                                    new DefaultHttpHeaders(),
+                                    MAXIMUM_FRAME_LENGTH));
+                            channel.pipeline().addLast("websocketAggregator", new WebSocketFrameAggregator(MAXIMUM_FRAME_LENGTH));
+                            channel.pipeline().addLast("frames", new UpstreamFrames(handshake));
+                        }
+                    })
+                    .connect(LOCAL_HOST, relay.port())
+                    .sync()
+                    .channel();
+        } catch (Exception exception) {
+            upstreamRelay = null;
+            relay.close();
+            throw exception;
+        }
         upstream = remote;
         try {
             handshake.get(15, TimeUnit.SECONDS);
         } catch (Exception exception) {
             upstream = null;
             remote.close();
+            upstreamRelay = null;
+            relay.close();
             if (exception instanceof ExecutionException execution && execution.getCause() instanceof Exception cause) {
                 throw cause;
             }
@@ -275,18 +288,6 @@ final class UnityStandaloneGateway implements AutoCloseable {
     private SslHandler localSsl(SSLContext context) {
         SSLEngine engine = context.createSSLEngine(LOCAL_HOST, port);
         engine.setUseClientMode(false);
-        SslHandler handler = new SslHandler(engine);
-        handler.setHandshakeTimeout(10, TimeUnit.SECONDS);
-        return handler;
-    }
-
-    private SslHandler upstreamSsl(String host) throws Exception {
-        SSLEngine engine = SSLContext.getDefault().createSSLEngine(host, port);
-        engine.setUseClientMode(true);
-        SSLParameters parameters = engine.getSSLParameters();
-        parameters.setEndpointIdentificationAlgorithm("HTTPS");
-        parameters.setServerNames(List.of(new SNIHostName(host)));
-        engine.setSSLParameters(parameters);
         SslHandler handler = new SslHandler(engine);
         handler.setHandshakeTimeout(10, TimeUnit.SECONDS);
         return handler;
