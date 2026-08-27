@@ -1,5 +1,5 @@
 import "frida-il2cpp-bridge";
-import { IncomingCoordinatorResult, IncomingFrameCoordinator } from "./incoming-stream";
+import { IncomingCipherContexts, IncomingCoordinatorResult, IncomingFrameCoordinator, UNITY_HEADER_LIMIT } from "./incoming-stream";
 
 function log(message: string): void { try { console.log(message); } catch (e) {} }
 
@@ -12,8 +12,10 @@ const DIR_TO_CLIENT = 0;
 const DIR_TO_SERVER = 1;
 const TAG_VERDICT = 0x10;
 const TAG_INJECT = 0x20;
-const MAX_HEADER = 4000;
-const MAX_FRAME_LENGTH = 0x200000;
+const MAX_HEADER = UNITY_HEADER_LIMIT - 1;
+const MAX_PACKET_LENGTH = 0x200000;
+const MAX_FRAME_LENGTH = MAX_PACKET_LENGTH - 4;
+const MAX_BRIDGE_PAYLOAD_LENGTH = MAX_PACKET_LENGTH + 1;
 
 // port and cookie come from frida-inject -P through rpc.exports.init
 let bridgeport = 9399;
@@ -114,10 +116,10 @@ let outCount = 0, inCount = 0;
 let outBusy = false;
 const frameHeader = Memory.alloc(6);
 const readHeader = Memory.alloc(5);
-const readBuffer = Memory.alloc(0x200000);
+const readBuffer = Memory.alloc(MAX_BRIDGE_PAYLOAD_LENGTH);
 function sendFrameRaw(type: number, direction: number, bytes: number[]): boolean {
   if (!bridgeReady) return false;
-  const len = bytes.length; const payload = Memory.alloc(len || 1);
+  const len = bytes.length; if (len > MAX_PACKET_LENGTH) return false; const payload = Memory.alloc(len || 1);
   for (let index = 0; index < len; index++) payload.add(index).writeU8(bytes[index]);
   frameHeader.writeU8(type); frameHeader.add(1).writeU8(direction);
   frameHeader.add(2).writeU8((len >> 24) & 0xff); frameHeader.add(3).writeU8((len >> 16) & 0xff);
@@ -133,7 +135,7 @@ function readFrame(): { tag: number; bytes: Uint8Array } | null {
   if (!recvAll(readHeader, 5)) return null;
   const tag = readHeader.readU8();
   const len = (readHeader.add(1).readU8() << 24) | (readHeader.add(2).readU8() << 16) | (readHeader.add(3).readU8() << 8) | readHeader.add(4).readU8();
-  if (len < 0 || len > 0x200000) return null;
+  if (len < 0 || len > MAX_BRIDGE_PAYLOAD_LENGTH) return null;
   if (len > 0 && !recvAll(readBuffer, len)) return null;
   return { tag, bytes: len > 0 ? new Uint8Array(readBuffer.readByteArray(len)!) : new Uint8Array(0) };
 }
@@ -162,24 +164,6 @@ function interceptOut(bytes: number[]): { blocked: boolean; bytes: number[] } | 
   } finally { leaveCriticalSection(criticalSection); outBusy = false; }
 }
 
-let inBusy = false;
-function interceptIn(bytes: number[]): { blocked: boolean; bytes: number[] } | null {
-  if (!bridgeReady || inBusy) { sendFrame(FRAME_NOTIFY, DIR_TO_CLIENT, bytes); return null; }
-  inBusy = true;
-  enterCriticalSection(criticalSection);
-  try {
-    if (!sendFrameRaw(FRAME_INTERCEPT, DIR_TO_CLIENT, bytes)) { bridgeReady = false; return null; }
-    let guard = 0;
-    for (; ;) {
-      if (++guard > 4096) { bridgeReady = false; return null; }
-      const frame = readFrame();
-      if (!frame) { bridgeReady = false; return null; }
-      if (frame.tag === TAG_INJECT) { queueInject(frame.bytes); continue; }
-      if (frame.tag === TAG_VERDICT) { const payload = frame.bytes; const result: number[] = []; for (let index = 1; index < payload.length; index++) result.push(payload[index]); return { blocked: payload.length > 0 && payload[0] === 1, bytes: result }; }
-    }
-  } finally { leaveCriticalSection(criticalSection); inBusy = false; }
-}
-
 // il2cpp array offsets, 32 vs 64 bit
 const pointerSize = Process.pointerSize;
 const ARRAY_LENGTH_OFFSET = pointerSize === 8 ? 24 : 12;
@@ -188,7 +172,7 @@ const ARRAY_DATA_OFFSET = pointerSize === 8 ? 32 : 16;
 function readArray(array: NativePointer, offset: number, length: number): number[] {
   const total = array.add(ARRAY_LENGTH_OFFSET).readS32();
   let available = (length && length > 0) ? Math.min(length, total - offset) : (total - offset);
-  if (available < 4 || available > 2000000) return [];
+  if (available < 4 || available > MAX_PACKET_LENGTH) return [];
   const lengthBytes = new Uint8Array(array.add(ARRAY_DATA_OFFSET + offset).readByteArray(4)!);
   const packetLength = (lengthBytes[0] << 24) | (lengthBytes[1] << 16) | (lengthBytes[2] << 8) | lengthBytes[3];
   // buffer is pooled and oversized, trim to the first frame
@@ -201,7 +185,7 @@ function readArray(array: NativePointer, offset: number, length: number): number
 }
 function readChunk(array: NativePointer, offset: number, length: number): number[] | null {
   const total = array.add(ARRAY_LENGTH_OFFSET).readS32();
-  if (offset < 0 || length <= 0 || length > MAX_FRAME_LENGTH + 4 || offset > total || length > total - offset) return null;
+  if (total < 0 || offset < 0 || length <= 0 || length > MAX_PACKET_LENGTH || offset > total || length > total - offset) return null;
   const raw = array.add(ARRAY_DATA_OFFSET + offset).readByteArray(length);
   if (raw === null) return null;
   const result: number[] = [];
@@ -212,7 +196,7 @@ function readChunk(array: NativePointer, offset: number, length: number): number
 function isHabbo(bytes: number[]): boolean {
   if (bytes.length < 6) return false;
   const len = ((bytes[0] & 0xff) << 24) | ((bytes[1] & 0xff) << 16) | ((bytes[2] & 0xff) << 8) | (bytes[3] & 0xff);
-  return len >= 2 && len <= 0x200000;
+  return len >= 2 && len <= MAX_FRAME_LENGTH;
 }
 function sameBytes(first: number[], second: number[]): boolean { if (first.length !== second.length) return false; for (let index = 0; index < first.length; index++) if ((first[index] & 0xff) !== (second[index] & 0xff)) return false; return true; }
 function splitFrames(array: NativePointer, total: number): number[][] | null {
@@ -227,17 +211,36 @@ function splitFrames(array: NativePointer, total: number): number[][] | null {
 }
 
 // recent cipher in/out pairs tagged by thread, used to recover the plaintext out header on the send thread
-const cipherLog: { input: number; output: number; engine: NativePointer; threadId: number }[] = []; const CIPHER_LOG_MAX = 256;
-function recordCipher(input: number, output: number, engine: NativePointer, threadId: number): void { cipherLog.push({ input, output, engine, threadId }); if (cipherLog.length > CIPHER_LOG_MAX) cipherLog.shift(); }
-function findByOutput(output: number, threadId: number): { input: number; output: number; engine: NativePointer; threadId: number } | null { for (let index = cipherLog.length - 1; index >= 0; index--) { const record = cipherLog[index]; if (record.output === output && record.threadId === threadId) return record; } return null; }
+type CipherRecord = { input: number; output: number; engine: NativePointer; threadId: number; address: NativePointer; method: NativePointer };
+const cipherLog: CipherRecord[] = []; const CIPHER_LOG_MAX = 256;
+function recordCipher(input: number, output: number, engine: NativePointer, threadId: number, address: NativePointer, method: NativePointer): void { cipherLog.push({ input, output, engine, threadId, address, method }); if (cipherLog.length > CIPHER_LOG_MAX) cipherLog.shift(); }
+function findCipherPair(output4: number, output5: number, threadId: number): { record4: CipherRecord; record5: CipherRecord } | null {
+  for (let index4 = cipherLog.length - 1; index4 >= 0; index4--) {
+    const record4 = cipherLog[index4];
+    if (record4.output !== output4 || record4.threadId !== threadId) continue;
+    for (let index5 = Math.min(cipherLog.length - 1, index4 + 16); index5 >= Math.max(0, index4 - 16); index5--) {
+      if (index5 === index4) continue;
+      const record5 = cipherLog[index5];
+      if (record5.output !== output5 || record5.threadId !== threadId || !record5.engine.equals(record4.engine) || !record5.address.equals(record4.address) || !record5.method.equals(record4.method)) continue;
+      if ((record4.input << 8 | record5.input) <= MAX_HEADER) return { record4, record5 };
+    }
+  }
+  return null;
+}
 
-const pendingDispatch: { blocked: boolean; original: number[]; bytes: number[] }[] = [];
-const incomingCoordinator = new IncomingFrameCoordinator(MAX_FRAME_LENGTH, MAX_HEADER, 6000);
+const incomingCoordinator = new IncomingFrameCoordinator(MAX_FRAME_LENGTH, MAX_HEADER, MAX_HEADER + 1);
+const incomingCipherContexts = new IncomingCipherContexts();
+const incomingReturnAddressesById = new Map<string, NativePointer>();
+let configuredIncomingId: string | null = null;
 let cipherActive = false;
+let cipherGeneration = 1;
 function resetCipherState(): void {
-  outEngine = null; inEngine = null; cipherActive = false; cipherLocked = false;
-  cipherLog.length = 0; pendingDispatch.length = 0;
-  incomingCoordinator.reset();
+  cipherGeneration++;
+  outEngine = null; inEngine = null; cipherActive = false;
+  cipherFn = null; cipherMethod = NULL; outCipherAddress = null;
+  outThreadId = 0; instantInject = false;
+  cipherLog.length = 0; incomingCoordinator.reset(); incomingCipherContexts.reset(); incomingReturnAddressesById.clear();
+  configuredIncomingId = null; resetToClientBinding(); injectQueue.length = 0; toClientQueue.length = 0;
   log("[agent] relogin detected, cipher state reset");
 }
 function isHello(bytes: number[]): boolean {
@@ -249,7 +252,7 @@ function isHello(bytes: number[]): boolean {
 // injection state
 let cipherFn: NativeFunction<number, [NativePointerValue, number, NativePointerValue]> | null = null;
 let cipherMethod: NativePointer = NULL;
-let cipherLocked = false;
+let outCipherAddress: NativePointer | null = null;
 let outEngine: NativePointer | null = null;
 let inEngine: NativePointer | null = null;
 let outSendFn: NativeFunction<void, [NativePointerValue, NativePointerValue, NativePointerValue]> | null = null;
@@ -260,6 +263,17 @@ let injecting = false;
 let outThreadId = 0;
 let instantInject = false;
 const injectQueue: { direction: number; header: number; body: number[] }[] = [];
+
+function lockOutCipher(record: CipherRecord): boolean {
+  if (outEngine && !outEngine.equals(record.engine)) return false;
+  if (outEngine && outCipherAddress && outCipherAddress.equals(record.address) && cipherMethod.equals(record.method) && cipherFn) return true;
+  outEngine = record.engine;
+  outCipherAddress = record.address;
+  cipherFn = new NativeFunction(record.address, "int", ["pointer", "int", "pointer"]);
+  cipherMethod = record.method;
+  log("[eng] outEngine locked " + record.engine + " cipher=0x" + record.address.sub(Il2Cpp.module.base).toString(16) + " tid=" + Process.getCurrentThreadId());
+  return true;
+}
 
 function encryptByte(value: number): number { try { return (cipherFn!(outEngine!, value, cipherMethod) as number) & 0xff; } catch (e) { return value; } }
 function buildOutPacket(header: number, body: number[]): number[] {
@@ -282,7 +296,7 @@ function injectToServer(header: number, body: number[]): boolean {
   finally { injecting = false; }
 }
 
-const ioctlResult = Memory.alloc(4), injectHeader = Memory.alloc(5), injectBuffer = Memory.alloc(0x40000);
+const ioctlResult = Memory.alloc(4), injectHeader = Memory.alloc(5), injectBuffer = Memory.alloc(MAX_BRIDGE_PAYLOAD_LENGTH);
 function pollInjects(): void {
   if (!bridgeReady) return;
   for (let guard = 0; guard < 64; guard++) {
@@ -292,7 +306,7 @@ function pollInjects(): void {
     if ((socketRecv(bridgeSocket, injectHeader, 5, 2) as number) !== 5) return;
     const tag = injectHeader.readU8();
     const len = (injectHeader.add(1).readU8() << 24) | (injectHeader.add(2).readU8() << 16) | (injectHeader.add(3).readU8() << 8) | injectHeader.add(4).readU8();
-    if (len < 0 || len > 0x40000) { bridgeReady = false; return; }
+    if (len < 0 || len > MAX_BRIDGE_PAYLOAD_LENGTH) { bridgeReady = false; return; }
     if (available < 5 + len) return;
     if (!recvAll(injectHeader, 5)) { bridgeReady = false; return; }
     if (len > 0 && !recvAll(injectBuffer, len)) { bridgeReady = false; return; }
@@ -301,22 +315,29 @@ function pollInjects(): void {
 }
 function flushInjects(): void {
   if (!injectQueue.length) return;
+  const pendingServer: { direction: number; header: number; body: number[] }[] = [];
   let queued: { direction: number; header: number; body: number[] } | undefined;
   while ((queued = injectQueue.shift())) {
-    if (queued.direction === DIR_TO_SERVER) { if (byteClass && outEngine && cipherFn) injectToServer(queued.header, queued.body); }
+    if (queued.direction === DIR_TO_SERVER) {
+      if (byteClass && outEngine && cipherFn && outSendFn && !outSendThis.isNull()) injectToServer(queued.header, queued.body);
+      else pendingServer.push(queued);
+    }
     else toClientQueue.push({ header: queued.header, body: queued.body });
   }
+  if (pendingServer.length) injectQueue.unshift(...pendingServer);
 }
 
 function interceptBatch(array: NativePointer, total: number, frames: number[][], args: InvocationArguments): void {
   const outFrames: number[][] = []; let changed = false;
   const sendThread = Process.getCurrentThreadId();
   for (const frame of frames) {
-    const match4 = findByOutput(frame[4], sendThread), match5 = findByOutput(frame[5], sendThread);
-    if (!(match4 && match5)) { if (bridgeReady && ((frame[4] << 8) | frame[5]) <= MAX_HEADER) notify(DIR_TO_SERVER, frame); outFrames.push(frame); continue; }
+    const pair = findCipherPair(frame[4], frame[5], sendThread);
+    if (!pair) { if (bridgeReady && ((frame[4] << 8) | frame[5]) <= MAX_HEADER) notify(DIR_TO_SERVER, frame); outFrames.push(frame); continue; }
+    const { record4: match4, record5: match5 } = pair;
+    if (!lockOutCipher(match4)) { outFrames.push(frame); continue; }
     const keystream4 = frame[4] ^ match4.input, keystream5 = frame[5] ^ match5.input;
     const plain = frame.slice(); plain[4] = match4.input; plain[5] = match5.input;
-    if (!outEngine) { outEngine = match4.engine; }
+    cipherActive = true;
     outCount++;
     let outFrame = frame;
     if (bridgeReady && cipherActive) {
@@ -338,9 +359,8 @@ function interceptBatch(array: NativePointer, total: number, frames: number[][],
   let combined: number[] = [];
   for (const outFrame of outFrames) combined = combined.concat(outFrame);
   if (extra.length) combined = combined.concat(extra);
-  if (combined.length <= total) {
+  if (combined.length === total) {
     for (let index = 0; index < combined.length; index++) array.add(ARRAY_DATA_OFFSET + index).writeU8(combined[index]);
-    for (let index = combined.length; index < total; index++) array.add(ARRAY_DATA_OFFSET + index).writeU8(0);
   } else {
     const byteArray = Il2Cpp.array<number>(byteClass!, combined);
     args[1] = byteArray.handle;
@@ -358,7 +378,18 @@ let toClientCtorArg0: NativePointer = NULL, toClientCtorArg1: NativePointer = NU
 let toClientDispatchTarget: NativePointer = NULL;
 let toClientByteClass: Il2Cpp.Class | null = null;
 let toClientReady = false, toClientInjecting = false;
+let toClientGeneration = 0;
+let toClientDispatchListener: { detach(): void } | null = null;
 const rvaOf = (address: NativePointer) => "0x" + address.sub(Il2Cpp.module.base).toString(16);
+
+function resetToClientBinding(): void {
+  toClientGeneration++;
+  if (toClientDispatchListener) { try { toClientDispatchListener.detach(); } catch (e) {} toClientDispatchListener = null; }
+  toClientReaderClass = null; toClientCtor = null; toClientRecv = null; toClientDispatch = null;
+  toClientCipherOffset = -1; toClientCtorArg0Offset = -1; toClientCtorArg1Offset = -1;
+  toClientCtorArg0 = NULL; toClientCtorArg1 = NULL; toClientDispatchTarget = NULL;
+  toClientReady = false; toClientInjecting = false;
+}
 
 function findReaderCtor(klass: Il2Cpp.Class): { address: NativePointer; param0Type: string; param1Type: string } | null {
   for (const method of klass.methods) {
@@ -375,13 +406,17 @@ function fieldOffsetByType(klass: Il2Cpp.Class, typeName: string): number {
 }
 function setupToClient(cand: Cand): boolean {
   try {
-    toClientRecv = new NativeFunction(cand.address, "void", ["pointer", "pointer", "int", "int", "pointer"]);
     const ctor = findReaderCtor(cand.klass); if (!ctor) { logErr("tc-setup", "no reader ctor"); return false; }
-    toClientCtor = new NativeFunction(ctor.address, "void", ["pointer", "pointer", "pointer", "pointer"]);
+    const recv = new NativeFunction(cand.address, "void", ["pointer", "pointer", "int", "int", "pointer"]);
+    const ctorFunction = new NativeFunction(ctor.address, "void", ["pointer", "pointer", "pointer", "pointer"]);
+    const ctorArg0Offset = fieldOffsetByType(cand.klass, ctor.param0Type);
+    const ctorArg1Offset = fieldOffsetByType(cand.klass, ctor.param1Type);
+    if (ctorArg0Offset < 0 || ctorArg1Offset < 0) { logErr("tc-setup", "field offset not found"); return false; }
+    toClientRecv = recv;
+    toClientCtor = ctorFunction;
     toClientCipherOffset = cand.cipherOffset;
-    toClientCtorArg0Offset = fieldOffsetByType(cand.klass, ctor.param0Type);
-    toClientCtorArg1Offset = fieldOffsetByType(cand.klass, ctor.param1Type);
-    if (toClientCtorArg0Offset < 0 || toClientCtorArg1Offset < 0) { logErr("tc-setup", "field offset not found"); return false; }
+    toClientCtorArg0Offset = ctorArg0Offset;
+    toClientCtorArg1Offset = ctorArg1Offset;
     toClientReaderClass = cand.klass;
     log("[tc] recvFn " + rvaOf(cand.address) + " ctorFn " + rvaOf(ctor.address) + " cipherOff 0x" + toClientCipherOffset.toString(16) + " regOff 0x" + toClientCtorArg0Offset.toString(16) + " arg2Off 0x" + toClientCtorArg1Offset.toString(16));
     return true;
@@ -402,7 +437,8 @@ function injectToClient(header: number, body: number[]): void {
     log("[tc] injected toclient hdr=" + header + " len=" + packet.length + " tid=" + Process.getCurrentThreadId());
   } catch (e) { logErr("tc-inject", e); } finally { toClientInjecting = false; }
 }
-function findToClientDispatch(returnAddress: NativePointer): boolean {
+function findToClientDispatch(returnAddress: NativePointer, generation: number): boolean {
+  if (generation !== toClientGeneration) return false;
   try {
     let cursor = returnAddress;
     const base = Il2Cpp.module.base, size = Il2Cpp.module.size;
@@ -410,30 +446,24 @@ function findToClientDispatch(returnAddress: NativePointer): boolean {
       const instruction = Instruction.parse(cursor);
       if (instruction.mnemonic === "call") {
         const match = instruction.opStr.match(/0x[0-9a-f]+/i);
-        if (match) { const target = ptr(match[0]); if (target.compare(base) > 0 && target.compare(base.add(size)) < 0) { toClientDispatch = new NativeFunction(target, "void", ["pointer", "pointer"]); log("[tc] dispatchFn " + rvaOf(target)); hookDispatch(target); return true; } }
+        if (match) { const target = ptr(match[0]); if (target.compare(base) > 0 && target.compare(base.add(size)) < 0) { const dispatch: NativeFunction<void, [NativePointerValue, NativePointerValue]> = new NativeFunction(target, "void", ["pointer", "pointer"]); hookDispatch(target, generation); if (generation !== toClientGeneration) return false; toClientDispatch = dispatch; log("[tc] dispatchFn " + rvaOf(target)); return true; } }
       }
       if (instruction.mnemonic === "ret") break; cursor = instruction.next;
     }
   } catch (e) { logErr("tc-disc", e); }
   return false;
 }
-function hookDispatch(address: NativePointer): void {
-  const original = toClientDispatch!;
-  Interceptor.replace(address, new NativeCallback((reader: NativePointer, target: NativePointer) => {
-    if (toClientInjecting) { original(reader, target); return; }
-    try {
-      toClientDispatchTarget = target; toClientReaderClass = new Il2Cpp.Object(reader).class;
-      if (!toClientReady) {
+function hookDispatch(address: NativePointer, generation: number): void {
+  toClientDispatchListener = Interceptor.attach(address, {
+    onEnter(args) {
+      if (generation !== toClientGeneration || toClientInjecting || toClientReady) return;
+      try {
+        const reader = args[0]; toClientDispatchTarget = args[1]; toClientReaderClass = new Il2Cpp.Object(reader).class;
         toClientCtorArg0 = reader.add(toClientCtorArg0Offset).readPointer(); toClientCtorArg1 = reader.add(toClientCtorArg1Offset).readPointer();
         if (!toClientDispatchTarget.isNull() && !toClientCtorArg0.isNull() && toClientByteClass) { toClientReady = true; log("[tc] ready, toclient inject armed"); }
-      }
-      const verdict = pendingDispatch.shift();
-      if (!verdict) { original(reader, target); return; }
-      if (verdict.blocked) return;
-      if (!toClientReady || verdict.bytes.length < 6 || !isHabbo(verdict.bytes) || sameBytes(verdict.bytes, verdict.original)) { original(reader, target); return; }
-      injectToClient((verdict.bytes[4] << 8) | verdict.bytes[5], verdict.bytes.slice(6));
-    } catch (e) { logErr("tc-dispatch", e); original(reader, target); }
-  }, "void", ["pointer", "pointer"]));
+      } catch (e) { logErr("tc-cap", e); }
+    }
+  });
 }
 
 let errorCount = 0;
@@ -452,8 +482,23 @@ function teardown(why: string): void {
 let inCipher = 0;
 
 interface Cand { address: NativePointer; handle: NativePointer; klass: Il2Cpp.Class; className: string; cipherOffset: number; }
+interface IncomingCandidateGroup { address: NativePointer; candidates: Cand[]; }
 function inModule(address: NativePointer): boolean { const base = Il2Cpp.module.base; return address.compare(base) >= 0 && address.compare(base.add(Il2Cpp.module.size)) < 0; }
 function cipherFieldOffset(klass: Il2Cpp.Class, cipherNames: Set<string>): number { for (const field of klass.fields) if (cipherNames.has(field.type.name)) return field.offset; return -1; }
+function incomingCandidateId(candidate: Cand): string { return candidate.address + ":" + candidate.handle + ":" + candidate.klass.handle + ":" + candidate.cipherOffset; }
+function incomingCandidateForCall(candidates: Cand[], instance: NativePointer, method: NativePointer): Cand | null {
+  if (!method.isNull()) {
+    const exactMethod = candidates.find(candidate => candidate.handle.equals(method));
+    if (exactMethod) return exactMethod;
+  }
+  let klass: Il2Cpp.Class | null = new Il2Cpp.Object(instance).class;
+  while (klass) {
+    const exactClass = candidates.find(candidate => candidate.klass.handle.equals(klass!.handle));
+    if (exactClass) return exactClass;
+    klass = klass.parent;
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
 
 function discover() {
   const cipher: Cand[] = [], outAll: Cand[] = [], inAll: Cand[] = [], outSend: Cand[] = [];
@@ -506,21 +551,28 @@ function main(): void {
   byteClass = Il2Cpp.corlib.class("System.Byte");
   toClientByteClass = byteClass;
   log("[disc] cipher=" + discovered.cipher.length + " outCand=" + discovered.outCand.length + " inCand=" + discovered.inCand.length + " outSend=" + discovered.outSend.length);
-  const incomingCandidates: Cand[] = [];
+  const incomingGroupsByAddress = new Map<string, IncomingCandidateGroup>();
   const incomingCandidatesById = new Map<string, Cand>();
   for (const candidate of discovered.inCand) {
-    const candidateId = candidate.address.toString();
+    const candidateId = incomingCandidateId(candidate);
     if (incomingCandidatesById.has(candidateId)) continue;
-    incomingCandidates.push(candidate);
     incomingCandidatesById.set(candidateId, candidate);
+    const address = candidate.address.toString();
+    const group = incomingGroupsByAddress.get(address);
+    if (group) group.candidates.push(candidate);
+    else incomingGroupsByAddress.set(address, { address: candidate.address, candidates: [candidate] });
   }
-  let configuredIncomingId: string | null = null;
   const configureIncoming = (candidate: Cand): void => {
-    const candidateId = candidate.address.toString();
-    if (configuredIncomingId === candidateId) return;
-    if (setupToClient(candidate)) configuredIncomingId = candidateId;
+    const candidateId = incomingCandidateId(candidate);
+    if (configuredIncomingId === candidateId && toClientRecv) return;
+    configuredIncomingId = null;
+    resetToClientBinding();
+    if (!setupToClient(candidate)) return;
+    configuredIncomingId = candidateId;
+    const returnAddress = incomingReturnAddressesById.get(candidateId);
+    if (returnAddress) findToClientDispatch(returnAddress, toClientGeneration);
   };
-  const publishIncoming = (result: IncomingCoordinatorResult): void => {
+  const publishIncoming = (result: IncomingCoordinatorResult, matchedEngine: NativePointer | null = null): void => {
     if (result.error) logErr("in-frame", result.error);
     if (result.boundChanged && result.boundCandidateId) {
       const candidate = incomingCandidatesById.get(result.boundCandidateId);
@@ -529,35 +581,44 @@ function main(): void {
         log("[IN bound] " + candidate.className);
       }
     }
+    if (result.cipherMatched && matchedEngine && !inEngine) {
+      inEngine = matchedEngine;
+      cipherActive = true;
+      log("[eng] inEngine locked " + matchedEngine + " tid=" + Process.getCurrentThreadId());
+    }
     for (const frame of result.frames) {
-      const header = frame.bytes[4] * 0x100 + frame.bytes[5];
-      const verdict = header <= MAX_HEADER ? interceptIn(frame.bytes) : null;
-      pendingDispatch.push({ blocked: verdict?.blocked ?? false, original: frame.bytes, bytes: verdict?.bytes ?? frame.bytes });
-      if (pendingDispatch.length > 512) { pendingDispatch.shift(); logErr("pendDispatch-cap", "dropped oldest"); }
       inCount++;
+      notify(DIR_TO_CLIENT, frame.bytes);
     }
   };
-  if (incomingCandidates.length) configureIncoming(incomingCandidates[0]);
-
-  if (discovered.cipher.length) { cipherFn = new NativeFunction(discovered.cipher[0].address, "int", ["pointer", "int", "pointer"]); cipherMethod = discovered.cipher[0].handle; }
-
-  discovered.cipher.forEach(cand => {
+  const cipherCandidates: Cand[] = [];
+  const cipherAddresses = new Set<string>();
+  for (const candidate of discovered.cipher) {
+    const address = candidate.address.toString();
+    if (cipherAddresses.has(address)) continue;
+    cipherAddresses.add(address);
+    cipherCandidates.push(candidate);
+  }
+  cipherCandidates.forEach(cand => {
     Interceptor.attach(cand.address, {
-      onEnter(args) { (this as any).inputByte = args[1].toInt32() & 0xff; (this as any).engine = args[0]; },
+      onEnter(args) { (this as any).inputByte = args[1].toInt32() & 0xff; (this as any).engine = args[0]; (this as any).method = args[2].isNull() ? cand.handle : args[2]; },
       onLeave(ret) {
         if (shuttingDown || injecting) return;
         try {
           const input = (this as any).inputByte as number;
-          const output = ret.toInt32() & 0xff; cipherActive = true;
+          const output = ret.toInt32() & 0xff;
           const engine = (this as any).engine as NativePointer;
-          const isInbound = outEngine ? !engine.equals(outEngine) : false;
-          if (isInbound && !inEngine) { inEngine = engine; log("[eng] inEngine locked " + engine + " tid=" + Process.getCurrentThreadId()); }
-          if (!isInbound) recordCipher(input, output, engine, Process.getCurrentThreadId());
-          // lock the cipher method that runs on the out engine, discovery can pick a different byte(byte)
-          if (!isInbound && outEngine && !cipherLocked) { cipherFn = new NativeFunction(cand.address, "int", ["pointer", "int", "pointer"]); cipherMethod = cand.handle; cipherLocked = true; log("[eng] out cipher locked " + rvaOf(cand.address)); }
-          if (isInbound && (outEngine || inEngine)) {
+          const method = (this as any).method as NativePointer;
+          const threadId = Process.getCurrentThreadId();
+          const incomingContext = incomingCipherContexts.match(threadId, engine.toString());
+          const incomingCandidateId = incomingContext?.candidateId ?? null;
+          const isInbound = incomingContext !== null;
+          if (!isInbound) recordCipher(input, output, engine, threadId, cand.address, method);
+          if (incomingCandidateId) {
+            if (!incomingContext!.current) return;
+            if (inEngine && !engine.equals(inEngine)) return;
             inCipher++;
-            publishIncoming(incomingCoordinator.cipher(Process.getCurrentThreadId(), input, output));
+            publishIncoming(incomingCoordinator.cipher(incomingCandidateId, engine.toString(), threadId, input, output, cand.address + ":" + method), engine);
           }
         } catch (e) { logErr("cipher", e); }
       }
@@ -565,7 +626,15 @@ function main(): void {
   });
 
   let boundOutSend: NativePointer | null = null;
-  discovered.outSend.forEach(cand => {
+  const outSendCandidates: Cand[] = [];
+  const outSendAddresses = new Set<string>();
+  for (const candidate of discovered.outSend) {
+    const address = candidate.address.toString();
+    if (outSendAddresses.has(address)) continue;
+    outSendAddresses.add(address);
+    outSendCandidates.push(candidate);
+  }
+  outSendCandidates.forEach(cand => {
     try {
       Interceptor.attach(cand.address, {
         onEnter(args) {
@@ -573,21 +642,23 @@ function main(): void {
           try {
             if (boundOutSend && !cand.address.equals(boundOutSend)) return;
             const array = args[1]; if (array.isNull()) return;
-            const total = array.add(ARRAY_LENGTH_OFFSET).readS32(); if (total < 6 || total > 2000000) return;
+            const total = array.add(ARRAY_LENGTH_OFFSET).readS32(); if (total < 6 || total > MAX_PACKET_LENGTH) return;
             const declaredLen = (array.add(ARRAY_DATA_OFFSET).readU8() * 0x1000000) + (array.add(ARRAY_DATA_OFFSET + 1).readU8() << 16) + (array.add(ARRAY_DATA_OFFSET + 2).readU8() << 8) + array.add(ARRAY_DATA_OFFSET + 3).readU8();
-            if (declaredLen < 2 || declaredLen > 0x200000) return;
+            if (declaredLen < 2 || declaredLen > MAX_FRAME_LENGTH) return;
             const bytes = readArray(array, 0, 0);
             if (!isHabbo(bytes)) return;
             if (!readyToConnect) { readyToConnect = true; if (gameHost) ensureConnected(); else setTimeout(() => Il2Cpp.perform(() => { captureHostFromMemory(); ensureConnected(); }), 0); }
-            if (!boundOutSend) { boundOutSend = cand.address; outSendFn = new NativeFunction(cand.address, "void", ["pointer", "pointer", "pointer"]); outThreadId = Process.getCurrentThreadId(); log("[OUT bound] " + cand.className + " tid=" + outThreadId); }
+            if (!boundOutSend) { boundOutSend = cand.address; outSendFn = new NativeFunction(cand.address, "void", ["pointer", "pointer", "pointer"]); log("[OUT bound] " + cand.className + " tid=" + Process.getCurrentThreadId()); }
+            outThreadId = Process.getCurrentThreadId();
             outSendThis = args[0]; outSendMethod = args[2];
             if (isHello(bytes)) resetCipherState();
             if (bytes.length < total) { const frames = splitFrames(array, total); if (frames && frames.length > 1) { interceptBatch(array, total, frames, args); return; } }
             outCount++;
             const sendThread = Process.getCurrentThreadId();
-            const record4 = findByOutput(bytes[4], sendThread), record5 = findByOutput(bytes[5], sendThread);
+            const pair = findCipherPair(bytes[4], bytes[5], sendThread);
+            const record4 = pair?.record4 ?? null, record5 = pair?.record5 ?? null;
             let keystream4 = 0, keystream5 = 0, havePlain = false;
-            if (record4 && record5) { keystream4 = bytes[4] ^ record4.input; keystream5 = bytes[5] ^ record5.input; bytes[4] = record4.input; bytes[5] = record5.input; havePlain = true; if (!outEngine) { outEngine = record4.engine; log("[eng] outEngine locked " + record4.engine + " tid=" + Process.getCurrentThreadId()); } }
+            if (record4 && record5 && lockOutCipher(record4)) { keystream4 = bytes[4] ^ record4.input; keystream5 = bytes[5] ^ record5.input; bytes[4] = record4.input; bytes[5] = record5.input; havePlain = true; cipherActive = true; }
             if (debugHeaders) log("[OUT] hdr=" + ((bytes[4] << 8) | bytes[5]) + " matched=" + havePlain + " len=" + total);
             let finalPlain: number[] | null = null;
             if (havePlain && bridgeReady && cipherActive) {
@@ -607,9 +678,8 @@ function main(): void {
             if (finalPlain !== null) { headBytes = finalPlain.slice(); if (headBytes.length >= 6) { headBytes[4] ^= keystream4; headBytes[5] ^= keystream5; } }
             else { headBytes = readArray(array, 0, originalLength); }
             const combined = extra.length ? headBytes.concat(extra) : headBytes;
-            if (combined.length <= total) {
+            if (combined.length === total) {
               for (let index = 0; index < combined.length; index++) array.add(ARRAY_DATA_OFFSET + index).writeU8(combined[index]);
-              for (let index = combined.length; index < total; index++) array.add(ARRAY_DATA_OFFSET + index).writeU8(0);
             } else { const byteArray = Il2Cpp.array<number>(byteClass!, combined); args[1] = byteArray.handle; }
           } catch (e) {}
         }
@@ -617,38 +687,58 @@ function main(): void {
     } catch (e) {}
   });
 
-  incomingCandidates.forEach(cand => {
-    const candidateAddress = cand.address.toString();
-    Interceptor.attach(cand.address, {
+  incomingGroupsByAddress.forEach(group => {
+    Interceptor.attach(group.address, {
       onEnter(args) {
         (this as any).incomingCandidateId = null;
         (this as any).incomingFrameIds = [];
         (this as any).incomingPlainEligible = false;
+        (this as any).incomingGeneration = 0;
+        (this as any).incomingContextThreadId = 0;
+        (this as any).incomingContextToken = 0;
         if (shuttingDown || toClientInjecting) return;
         try {
-          if (incomingCoordinator.boundCandidateId !== null && incomingCoordinator.boundCandidateId !== candidateAddress) return;
+          const cand = incomingCandidateForCall(group.candidates, args[0], args[4]);
+          if (!cand) return;
+          const candidateId = incomingCandidateId(cand);
+          if (incomingCoordinator.boundCandidateId !== null && incomingCoordinator.boundCandidateId !== candidateId) return;
+          (this as any).incomingGeneration = cipherGeneration;
           const threadId = Process.getCurrentThreadId();
+          const incomingEngine = args[0].add(cand.cipherOffset).readPointer();
+          if (!incomingEngine.isNull()) {
+            (this as any).incomingContextThreadId = threadId;
+            (this as any).incomingContextToken = incomingCipherContexts.enter(candidateId, incomingEngine.toString(), threadId);
+          }
           const array = args[1], offset = args[2].toInt32(), length = args[3].toInt32();
           if (array.isNull() || length <= 0) return;
-          if (toClientRecv && !toClientDispatch) findToClientDispatch((this as any).returnAddress);
+          const returnAddress = (this as any).returnAddress as NativePointer;
+          incomingReturnAddressesById.set(candidateId, returnAddress);
+          if (configuredIncomingId === candidateId && toClientRecv && !toClientDispatch) findToClientDispatch(returnAddress, toClientGeneration);
           const chunk = readChunk(array, offset, length);
           if (chunk === null) {
-            publishIncoming(incomingCoordinator.reject(candidateAddress, threadId, "incoming receive range is invalid"));
+            publishIncoming(incomingCoordinator.reject(candidateId, "incoming receive range is invalid"));
             return;
           }
-          const result = incomingCoordinator.append(candidateAddress, threadId, chunk);
-          (this as any).incomingCandidateId = candidateAddress;
+          const result = incomingCoordinator.append(candidateId, threadId, chunk);
+          (this as any).incomingCandidateId = candidateId;
           (this as any).incomingFrameIds = result.completedFrameIds;
-          (this as any).incomingPlainEligible = !cipherActive;
+          (this as any).incomingPlainEligible = incomingEngine.isNull();
           publishIncoming(result);
         } catch (e) { logErr("inrecv", e); }
       },
       onLeave() {
-        if (shuttingDown || !(this as any).incomingPlainEligible || cipherActive) return;
-        const candidateId = (this as any).incomingCandidateId as string | null;
-        const frameIds = (this as any).incomingFrameIds as number[];
-        if (!candidateId || frameIds.length === 0) return;
-        publishIncoming(incomingCoordinator.plain(candidateId, frameIds));
+        const contextThreadId = (this as any).incomingContextThreadId as number;
+        const contextToken = (this as any).incomingContextToken as number;
+        try {
+          if (shuttingDown || !(this as any).incomingPlainEligible) return;
+          if ((this as any).incomingGeneration !== cipherGeneration) return;
+          const candidateId = (this as any).incomingCandidateId as string | null;
+          const frameIds = (this as any).incomingFrameIds as number[];
+          if (!candidateId || frameIds.length === 0) return;
+          publishIncoming(incomingCoordinator.plain(candidateId, frameIds));
+        } finally {
+          if (contextToken) incomingCipherContexts.leave(contextThreadId, contextToken);
+        }
       }
     });
   });

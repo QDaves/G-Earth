@@ -1,3 +1,5 @@
+export const UNITY_HEADER_LIMIT = 6000;
+
 export interface IncomingFrameStart {
   id: number;
   cipher4: number;
@@ -25,6 +27,7 @@ export interface IncomingCoordinatorResult {
   completedFrameIds: number[];
   boundCandidateId: string | null;
   boundChanged: boolean;
+  cipherMatched: boolean;
   error: string | null;
 }
 
@@ -42,6 +45,56 @@ interface PendingFrame {
 interface CipherHalf {
   input: number;
   plain: number;
+}
+
+type CipherOrder = "fifth-first" | "fourth-first";
+
+interface CipherContext {
+  token: number;
+  candidateId: string;
+  engineId: string;
+  generation: number;
+}
+
+export interface IncomingCipherContextMatch {
+  candidateId: string;
+  current: boolean;
+}
+
+export class IncomingCipherContexts {
+  private readonly contexts = new Map<number, CipherContext[]>();
+  private nextToken = 1;
+  private generation = 1;
+
+  enter(candidateId: string, engineId: string, threadId: number): number {
+    const token = this.nextToken++;
+    const stack = this.contexts.get(threadId);
+    const context = { token, candidateId, engineId, generation: this.generation };
+    if (stack) stack.push(context);
+    else this.contexts.set(threadId, [context]);
+    return token;
+  }
+
+  match(threadId: number, engineId: string): IncomingCipherContextMatch | null {
+    const stack = this.contexts.get(threadId);
+    if (!stack) return null;
+    for (let index = stack.length - 1; index >= 0; index--) {
+      if (stack[index].engineId === engineId) return { candidateId: stack[index].candidateId, current: stack[index].generation === this.generation };
+    }
+    return null;
+  }
+
+  leave(threadId: number, token: number): void {
+    const stack = this.contexts.get(threadId);
+    if (!stack) return;
+    const index = stack.findIndex(context => context.token === token);
+    if (index >= 0) stack.splice(index, 1);
+    if (stack.length === 0) this.contexts.delete(threadId);
+  }
+
+  reset(): void {
+    this.generation++;
+  }
 }
 
 export class IncomingFrameStream {
@@ -64,7 +117,7 @@ export class IncomingFrameStream {
   append(chunk: readonly number[]): IncomingStreamResult {
     const result: IncomingStreamResult = { starts: [], frames: [], error: null };
     if (this.failed || chunk.length === 0) return result;
-    if (chunk.length > this.maximumFrameLength + 4 || this.buffer.length - this.position + chunk.length > this.maximumBufferedLength) {
+    if (chunk.length > this.maximumBufferedLength || this.buffer.length - this.position + chunk.length > this.maximumBufferedLength) {
       return this.fail(result, "incoming frame buffer exceeds limit");
     }
 
@@ -155,20 +208,25 @@ export class IncomingFrameCoordinator {
   private readonly maximumPlainHeader: number;
   private readonly maximumCipherHeader: number;
   private readonly maximumPendingFrames: number;
+  private readonly maximumPendingBytes: number;
   private readonly streams = new Map<string, IncomingFrameStream>();
   private readonly failedCandidates = new Set<string>();
-  private readonly cipherHalves = new Map<number, CipherHalf>();
+  private readonly cipherHalves = new Map<string, CipherHalf>();
+  private readonly cipherOrders = new Map<string, CipherOrder>();
   private pending: PendingFrame[] = [];
+  private pendingBytes = 0;
   private bound: string | null = null;
 
-  constructor(maximumFrameLength: number, maximumPlainHeader: number, maximumCipherHeader: number, maximumPendingFrames = 4096) {
+  constructor(maximumFrameLength: number, maximumPlainHeader: number, maximumCipherHeader: number, maximumPendingFrames = 4096, maximumPendingBytes = (maximumFrameLength + 4) * 2) {
     if (!Number.isInteger(maximumPlainHeader) || maximumPlainHeader < 0) throw new RangeError("maximumPlainHeader");
     if (!Number.isInteger(maximumCipherHeader) || maximumCipherHeader < maximumPlainHeader) throw new RangeError("maximumCipherHeader");
     if (!Number.isInteger(maximumPendingFrames) || maximumPendingFrames < 1) throw new RangeError("maximumPendingFrames");
+    if (!Number.isInteger(maximumPendingBytes) || maximumPendingBytes < 1) throw new RangeError("maximumPendingBytes");
     this.maximumFrameLength = maximumFrameLength;
     this.maximumPlainHeader = maximumPlainHeader;
     this.maximumCipherHeader = maximumCipherHeader;
     this.maximumPendingFrames = maximumPendingFrames;
+    this.maximumPendingBytes = maximumPendingBytes;
   }
 
   get boundCandidateId(): string | null {
@@ -177,6 +235,10 @@ export class IncomingFrameCoordinator {
 
   get pendingCount(): number {
     return this.pending.length;
+  }
+
+  get pendingByteCount(): number {
+    return this.pendingBytes;
   }
 
   append(candidateId: string, threadId: number, chunk: readonly number[]): IncomingCoordinatorResult {
@@ -191,7 +253,7 @@ export class IncomingFrameCoordinator {
 
     const parsed = stream.append(chunk);
     if (parsed.error) {
-      this.failCandidate(candidateId, threadId);
+      this.failCandidate(candidateId);
       result.error = parsed.error;
       return result;
     }
@@ -210,20 +272,28 @@ export class IncomingFrameCoordinator {
     }
 
     if (this.pending.length > this.maximumPendingFrames) {
-      this.failCandidate(candidateId, threadId);
+      this.failCandidate(candidateId);
       result.error = "incoming frame state exceeds limit";
+      return result;
+    }
+
+    const completedBytes = parsed.frames.reduce((total, frame) => total + frame.bytes.length, 0);
+    if (this.pendingBytes + completedBytes > this.maximumPendingBytes) {
+      this.failCandidate(candidateId);
+      result.error = "incoming frame payload state exceeds limit";
       return result;
     }
 
     for (const frame of parsed.frames) {
       const entry = this.pending.find(candidate => candidate.candidateId === candidateId && candidate.frameId === frame.id);
       if (!entry) {
-        this.failCandidate(candidateId, threadId);
+        this.failCandidate(candidateId);
         result.error = "completed incoming frame has no registered header";
         return result;
       }
       if (entry.plain4 === null && entry.plain5 === null) entry.threadId = threadId;
       entry.bytes = frame.bytes;
+      this.pendingBytes += frame.bytes.length;
       result.completedFrameIds.push(frame.id);
       const ready = this.takeReady(entry);
       if (ready) result.frames.push(ready);
@@ -233,48 +303,54 @@ export class IncomingFrameCoordinator {
     return result;
   }
 
-  cipher(threadId: number, input: number, plain: number): IncomingCoordinatorResult {
+  cipher(candidateId: string, engineId: string, threadId: number, input: number, plain: number, methodId = "default"): IncomingCoordinatorResult {
     const result = this.result();
-    const candidates = this.pending.filter(entry => entry.threadId === threadId && entry.plain4 === null && entry.plain5 === null && (this.bound === null || entry.candidateId === this.bound));
+    if (this.failedCandidates.has(candidateId) || this.bound !== null && this.bound !== candidateId) return result;
+    this.matchCipher(candidateId, engineId, methodId, threadId, input, plain, result);
+    return result;
+  }
+
+  private matchCipher(candidateId: string, engineId: string, methodId: string, threadId: number, input: number, plain: number, result: IncomingCoordinatorResult): boolean {
+    const halfKey = candidateId + ":" + engineId + ":" + methodId + ":" + threadId;
+    const candidates = this.pending.filter(entry => entry.candidateId === candidateId && entry.threadId === threadId && entry.plain4 === null && entry.plain5 === null);
     if (candidates.length === 0) {
-      this.cipherHalves.delete(threadId);
-      return result;
+      this.cipherHalves.delete(halfKey);
+      return false;
     }
 
     const current = { input: input & 0xff, plain: plain & 0xff };
-    const previous = this.cipherHalves.get(threadId);
+    const previous = this.cipherHalves.get(halfKey);
     if (!previous) {
-      this.cipherHalves.set(threadId, current);
-      return result;
+      this.cipherHalves.set(halfKey, current);
+      return false;
     }
 
     for (const entry of candidates) {
-      let plain4: number;
-      let plain5: number;
-      if (entry.cipher5 === previous.input && entry.cipher4 === current.input) {
-        plain5 = previous.plain;
-        plain4 = current.plain;
-      } else if (entry.cipher5 === current.input && entry.cipher4 === previous.input) {
-        plain5 = current.plain;
-        plain4 = previous.plain;
-      } else {
-        continue;
-      }
+      const fifthFirst = entry.cipher5 === previous.input && entry.cipher4 === current.input;
+      const fourthFirst = entry.cipher4 === previous.input && entry.cipher5 === current.input;
+      if (!fifthFirst && !fourthFirst) continue;
+
+      const orderKey = candidateId + ":" + engineId + ":" + methodId;
+      const order = fifthFirst && fourthFirst ? this.cipherOrders.get(orderKey) ?? "fifth-first" : fifthFirst ? "fifth-first" : "fourth-first";
+      const plain4 = order === "fifth-first" ? current.plain : previous.plain;
+      const plain5 = order === "fifth-first" ? previous.plain : current.plain;
 
       const header = plain4 * 0x100 + plain5;
       if (header >= this.maximumCipherHeader) continue;
+      this.cipherOrders.set(orderKey, order);
       entry.plain4 = plain4;
       entry.plain5 = plain5;
       result.boundChanged = this.bind(entry.candidateId);
       result.boundCandidateId = this.bound;
-      this.cipherHalves.delete(threadId);
+      result.cipherMatched = true;
+      this.cipherHalves.delete(halfKey);
       const ready = this.takeReady(entry);
       if (ready) result.frames.push(ready);
-      return result;
+      return true;
     }
 
-    this.cipherHalves.set(threadId, current);
-    return result;
+    this.cipherHalves.set(halfKey, current);
+    return false;
   }
 
   plain(candidateId: string, frameIds: readonly number[]): IncomingCoordinatorResult {
@@ -286,7 +362,7 @@ export class IncomingFrameCoordinator {
       if (!entry || entry.bytes === null || entry.plain4 !== null || entry.plain5 !== null) continue;
       const header = entry.bytes[4] * 0x100 + entry.bytes[5];
       if (header > this.maximumPlainHeader) {
-        this.failCandidate(candidateId, entry.threadId);
+        this.failCandidate(candidateId);
         result.error = "invalid plaintext incoming header " + header;
         return result;
       }
@@ -301,10 +377,10 @@ export class IncomingFrameCoordinator {
     return result;
   }
 
-  reject(candidateId: string, threadId: number, error: string): IncomingCoordinatorResult {
+  reject(candidateId: string, error: string): IncomingCoordinatorResult {
     const result = this.result();
     if (!this.failedCandidates.has(candidateId) && (this.bound === null || this.bound === candidateId)) {
-      this.failCandidate(candidateId, threadId);
+      this.failCandidate(candidateId);
       result.error = error;
     }
     return result;
@@ -314,7 +390,9 @@ export class IncomingFrameCoordinator {
     this.streams.clear();
     this.failedCandidates.clear();
     this.cipherHalves.clear();
+    this.cipherOrders.clear();
     this.pending = [];
+    this.pendingBytes = 0;
     this.bound = null;
   }
 
@@ -324,6 +402,7 @@ export class IncomingFrameCoordinator {
       completedFrameIds: [],
       boundCandidateId: this.bound,
       boundChanged: false,
+      cipherMatched: false,
       error: null,
     };
   }
@@ -331,10 +410,12 @@ export class IncomingFrameCoordinator {
   private bind(candidateId: string): boolean {
     if (this.bound !== null) return false;
     this.bound = candidateId;
+    for (const entry of this.pending) if (entry.candidateId !== candidateId && entry.bytes !== null) this.pendingBytes -= entry.bytes.length;
     this.pending = this.pending.filter(entry => entry.candidateId === candidateId);
     for (const streamId of this.streams.keys()) if (streamId !== candidateId) this.streams.delete(streamId);
     for (const failedId of this.failedCandidates) if (failedId !== candidateId) this.failedCandidates.delete(failedId);
     this.cipherHalves.clear();
+    for (const key of this.cipherOrders.keys()) if (!key.startsWith(candidateId + ":")) this.cipherOrders.delete(key);
     return true;
   }
 
@@ -343,17 +424,22 @@ export class IncomingFrameCoordinator {
     const index = this.pending.indexOf(entry);
     if (index < 0) return null;
     this.pending.splice(index, 1);
+    this.pendingBytes -= entry.bytes.length;
     entry.bytes[4] = entry.plain4;
     entry.bytes[5] = entry.plain5;
     return { candidateId: entry.candidateId, frameId: entry.frameId, bytes: entry.bytes };
   }
 
-  private failCandidate(candidateId: string, threadId: number): void {
-    const threadIds = new Set<number>([threadId]);
-    for (const entry of this.pending) if (entry.candidateId === candidateId) threadIds.add(entry.threadId);
+  private failCandidate(candidateId: string): void {
     this.failedCandidates.add(candidateId);
     this.streams.delete(candidateId);
+    for (const entry of this.pending) if (entry.candidateId === candidateId && entry.bytes !== null) this.pendingBytes -= entry.bytes.length;
     this.pending = this.pending.filter(entry => entry.candidateId !== candidateId);
-    for (const candidateThreadId of threadIds) this.cipherHalves.delete(candidateThreadId);
+    this.clearCipherState(candidateId);
+  }
+
+  private clearCipherState(candidateId: string): void {
+    for (const key of this.cipherHalves.keys()) if (key.startsWith(candidateId + ":")) this.cipherHalves.delete(key);
+    for (const key of this.cipherOrders.keys()) if (key.startsWith(candidateId + ":")) this.cipherOrders.delete(key);
   }
 }
