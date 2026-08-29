@@ -214,6 +214,7 @@ function splitFrames(array: NativePointer, total: number): number[][] | null {
 type CipherRecord = { input: number; output: number; engine: NativePointer; threadId: number; address: NativePointer; method: NativePointer };
 const cipherLog: CipherRecord[] = []; const CIPHER_LOG_MAX = 256;
 function recordCipher(input: number, output: number, engine: NativePointer, threadId: number, address: NativePointer, method: NativePointer): void { cipherLog.push({ input, output, engine, threadId, address, method }); if (cipherLog.length > CIPHER_LOG_MAX) cipherLog.shift(); }
+function removeCipherRecords(engine: NativePointer): void { for (let index = cipherLog.length - 1; index >= 0; index--) if (cipherLog[index].engine.equals(engine)) cipherLog.splice(index, 1); }
 function findCipherPair(output4: number, output5: number, threadId: number): { record4: CipherRecord; record5: CipherRecord } | null {
   for (let index4 = cipherLog.length - 1; index4 >= 0; index4--) {
     const record4 = cipherLog[index4];
@@ -584,6 +585,7 @@ function main(): void {
     if (result.cipherMatched && matchedEngine && !inEngine) {
       inEngine = matchedEngine;
       cipherActive = true;
+      removeCipherRecords(matchedEngine);
       log("[eng] inEngine locked " + matchedEngine + " tid=" + Process.getCurrentThreadId());
     }
     for (const frame of result.frames) {
@@ -611,14 +613,24 @@ function main(): void {
           const method = (this as any).method as NativePointer;
           const threadId = Process.getCurrentThreadId();
           const incomingContext = incomingCipherContexts.match(threadId, engine.toString());
-          const incomingCandidateId = incomingContext?.candidateId ?? null;
-          const isInbound = incomingContext !== null;
-          if (!isInbound) recordCipher(input, output, engine, threadId, cand.address, method);
+          if (incomingContext && !incomingContext.current) return;
+          const boundCandidateId = incomingCoordinator.boundCandidateId;
+          let incomingCandidateId = incomingContext?.candidateId ?? null;
+          if (!incomingContext) {
+            const isOutgoingEngine = outEngine !== null && engine.equals(outEngine) && (inEngine === null || !engine.equals(inEngine));
+            if (!isOutgoingEngine) {
+              if (inEngine === null || engine.equals(inEngine)) {
+                incomingCandidateId = incomingCipherContexts.resolveCandidate(engine.toString(), boundCandidateId);
+              }
+            }
+          }
+          const allowCrossThread = incomingCandidateId !== null;
+          const isKnownInbound = inEngine !== null && engine.equals(inEngine);
+          if (!isKnownInbound) recordCipher(input, output, engine, threadId, cand.address, method);
           if (incomingCandidateId) {
-            if (!incomingContext!.current) return;
             if (inEngine && !engine.equals(inEngine)) return;
             inCipher++;
-            publishIncoming(incomingCoordinator.cipher(incomingCandidateId, engine.toString(), threadId, input, output, cand.address + ":" + method), engine);
+            publishIncoming(incomingCoordinator.cipher(incomingCandidateId, engine.toString(), threadId, input, output, cand.address + ":" + method, allowCrossThread), engine);
           }
         } catch (e) { logErr("cipher", e); }
       }
@@ -705,10 +717,6 @@ function main(): void {
           (this as any).incomingGeneration = cipherGeneration;
           const threadId = Process.getCurrentThreadId();
           const incomingEngine = args[0].add(cand.cipherOffset).readPointer();
-          if (!incomingEngine.isNull()) {
-            (this as any).incomingContextThreadId = threadId;
-            (this as any).incomingContextToken = incomingCipherContexts.enter(candidateId, incomingEngine.toString(), threadId);
-          }
           const array = args[1], offset = args[2].toInt32(), length = args[3].toInt32();
           if (array.isNull() || length <= 0) return;
           const returnAddress = (this as any).returnAddress as NativePointer;
@@ -720,6 +728,12 @@ function main(): void {
             return;
           }
           const result = incomingCoordinator.append(candidateId, threadId, chunk);
+          if (result.error) incomingCipherContexts.forgetCandidate(candidateId);
+          else if (!incomingEngine.isNull()) {
+            incomingCipherContexts.rememberCandidate(candidateId, incomingEngine.toString());
+            (this as any).incomingContextThreadId = threadId;
+            (this as any).incomingContextToken = incomingCipherContexts.enter(candidateId, incomingEngine.toString(), threadId);
+          }
           (this as any).incomingCandidateId = candidateId;
           (this as any).incomingFrameIds = result.completedFrameIds;
           (this as any).incomingPlainEligible = incomingEngine.isNull();

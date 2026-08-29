@@ -158,6 +158,19 @@ function header(bytes, first, second) {
 
 {
   const coordinator = new IncomingFrameCoordinator(0x200000, 4000, 6000);
+  const expected = header(frame(18, 0x41), 0xa1, 0xa2);
+  coordinator.append("candidate-a", 11, expected);
+  assert.equal(coordinator.cipher("candidate-a", "engine-a", 22, 0xa1, 0x02).cipherMatched, false);
+  coordinator.cipher("candidate-a", "engine-a", 22, 0xa1, 0x02, "method-a", true);
+  const ready = coordinator.cipher("candidate-a", "engine-a", 22, 0xa2, 0x34, "method-a", true);
+  assert.equal(ready.boundCandidateId, "candidate-a");
+  assert.equal(ready.cipherMatched, true);
+  assert.equal(ready.frames.length, 1);
+  assert.deepEqual(ready.frames[0].bytes.slice(4, 6), [0x02, 0x34]);
+}
+
+{
+  const coordinator = new IncomingFrameCoordinator(0x200000, 4000, 6000);
   const firstFrame = header(frame(8, 0x41), 0xb1, 0xb2);
   const secondFrame = header(frame(9, 0x51), 0xc1, 0xc2);
   const complete = coordinator.append("candidate-a", 13, firstFrame.concat(secondFrame));
@@ -274,6 +287,13 @@ function header(bytes, first, second) {
 
 {
   const contexts = new IncomingCipherContexts();
+  contexts.rememberCandidate("candidate-a", "engine-a");
+  assert.equal(contexts.resolveCandidate("engine-a"), "candidate-a");
+  contexts.rememberCandidate("candidate-b", "engine-a");
+  assert.equal(contexts.resolveCandidate("engine-a"), null);
+  assert.equal(contexts.resolveCandidate("engine-a", "candidate-b"), "candidate-b");
+  contexts.forgetCandidate("candidate-b");
+  assert.equal(contexts.resolveCandidate("engine-a"), "candidate-a");
   const outer = contexts.enter("candidate-a", "engine-shared", 91);
   const inner = contexts.enter("candidate-b", "engine-shared", 91);
   assert.deepEqual(contexts.match(91, "engine-shared"), { candidateId: "candidate-b", current: true });
@@ -290,6 +310,8 @@ function header(bytes, first, second) {
   assert.deepEqual(contexts.match(92, "engine-old"), { candidateId: "candidate-new", current: true });
   contexts.leave(92, current);
   assert.equal(contexts.match(92, "engine-old"), null);
+  contexts.reset();
+  assert.equal(contexts.resolveCandidate("engine-a", "candidate-a"), null);
 }
 
 {

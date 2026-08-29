@@ -63,8 +63,30 @@ export interface IncomingCipherContextMatch {
 
 export class IncomingCipherContexts {
   private readonly contexts = new Map<number, CipherContext[]>();
+  private readonly candidatesByEngine = new Map<string, Set<string>>();
   private nextToken = 1;
   private generation = 1;
+
+  rememberCandidate(candidateId: string, engineId: string): void {
+    const candidates = this.candidatesByEngine.get(engineId);
+    if (candidates) candidates.add(candidateId);
+    else this.candidatesByEngine.set(engineId, new Set([candidateId]));
+  }
+
+  forgetCandidate(candidateId: string): void {
+    for (const [engineId, candidates] of this.candidatesByEngine) {
+      candidates.delete(candidateId);
+      if (candidates.size === 0) this.candidatesByEngine.delete(engineId);
+    }
+  }
+
+  resolveCandidate(engineId: string, preferredCandidateId: string | null = null): string | null {
+    const candidates = this.candidatesByEngine.get(engineId);
+    if (!candidates || candidates.size === 0) return null;
+    if (preferredCandidateId && candidates.has(preferredCandidateId)) return preferredCandidateId;
+    if (candidates.size !== 1) return null;
+    return candidates.values().next().value ?? null;
+  }
 
   enter(candidateId: string, engineId: string, threadId: number): number {
     const token = this.nextToken++;
@@ -94,6 +116,7 @@ export class IncomingCipherContexts {
 
   reset(): void {
     this.generation++;
+    this.candidatesByEngine.clear();
   }
 }
 
@@ -303,16 +326,16 @@ export class IncomingFrameCoordinator {
     return result;
   }
 
-  cipher(candidateId: string, engineId: string, threadId: number, input: number, plain: number, methodId = "default"): IncomingCoordinatorResult {
+  cipher(candidateId: string, engineId: string, threadId: number, input: number, plain: number, methodId = "default", allowCrossThread = false): IncomingCoordinatorResult {
     const result = this.result();
     if (this.failedCandidates.has(candidateId) || this.bound !== null && this.bound !== candidateId) return result;
-    this.matchCipher(candidateId, engineId, methodId, threadId, input, plain, result);
+    this.matchCipher(candidateId, engineId, methodId, threadId, input, plain, allowCrossThread, result);
     return result;
   }
 
-  private matchCipher(candidateId: string, engineId: string, methodId: string, threadId: number, input: number, plain: number, result: IncomingCoordinatorResult): boolean {
+  private matchCipher(candidateId: string, engineId: string, methodId: string, threadId: number, input: number, plain: number, allowCrossThread: boolean, result: IncomingCoordinatorResult): boolean {
     const halfKey = candidateId + ":" + engineId + ":" + methodId + ":" + threadId;
-    const candidates = this.pending.filter(entry => entry.candidateId === candidateId && entry.threadId === threadId && entry.plain4 === null && entry.plain5 === null);
+    const candidates = this.pending.filter(entry => entry.candidateId === candidateId && (allowCrossThread || entry.threadId === threadId) && entry.plain4 === null && entry.plain5 === null);
     if (candidates.length === 0) {
       this.cipherHalves.delete(halfKey);
       return false;
